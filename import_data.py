@@ -10,7 +10,7 @@ DB_CONFIG = {
     "dbname": "amazon",
     "user": "postgres",
     "password": "user",
-    "host": "34.142.193.208",  # Gcloud: 34.142.193.208
+    "host": "34.142.201.81",  # Gcloud: 34.142.201.81
     "port": "5432"
 }
 
