@@ -4,29 +4,62 @@ import numpy as np
 import faiss
 import torch
 from sentence_transformers import SentenceTransformer
-import matplotlib.pyplot as plt
-import io
 from PIL import Image
 import requests
 import os
+import psycopg2
 import re
 
-# Đường dẫn tệp (có thể tùy chỉnh theo thư mục local của bạn)
+# Directory and file paths
 DATA_DIR = "./data"
 CSV_FILE = "./amazon.csv"
 EMBEDDING_FILE = os.path.join(DATA_DIR, "embeddings.npy")
 FAISS_INDEX_FILE = os.path.join(DATA_DIR, "faiss_index.bin")
 
-# Kiểm tra xem các tệp có tồn tại không
+# PostgreSQL configuration
+DB_CONFIG = {
+    "dbname": "amazon",
+    "user": "postgres",
+    "password": "user",
+    "host": "34.142.201.81",
+    "port": "5432"
+}
+
+# Check for required files
 for file_path in [CSV_FILE, EMBEDDING_FILE, FAISS_INDEX_FILE]:
     if not os.path.exists(file_path):
         raise FileNotFoundError(
             f"Không tìm thấy tệp: {file_path}. Vui lòng đảm bảo tệp đã được tạo từ trước.")
 
-# Tải dữ liệu
+# Load CSV for initial mapping
 df = pd.read_csv(CSV_FILE, encoding="utf-8")
 
-# Hàm làm sạch dữ liệu (từ mã gốc của bạn)
+# FAISS setup
+embeddings = np.load(EMBEDDING_FILE)
+index = faiss.read_index(FAISS_INDEX_FILE)
+model = SentenceTransformer('all-MiniLM-L6-v2')
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model.to(device)
+
+if torch.cuda.is_available():
+    res = faiss.StandardGpuResources()
+    gpu_index = faiss.index_cpu_to_gpu(res, 0, index)
+else:
+    gpu_index = index
+
+# PostgreSQL connection
+
+
+def connect_db():
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        conn.autocommit = True
+        return conn
+    except psycopg2.Error as e:
+        print(f"❌ Lỗi kết nối PostgreSQL: {e}")
+        return None
+
+# Clean and refactor data
 
 
 def clean_data(df):
@@ -65,143 +98,166 @@ def clean_data(df):
     df["link"] = df["product_link"].astype(str).str.strip()
     return df
 
-# Hàm refactor dữ liệu (từ mã gốc của bạn)
-
 
 def refactor_data(df):
-    category_map = {
-        f"{row['main_category']}|{row['sub_category']}": idx
-        for idx, row in enumerate(df[["main_category", "sub_category"]].drop_duplicates().to_dict(orient="records"), start=1)
-    }
+    category_map = {f"{row['main_category']}|{row['sub_category']}": idx
+                    for idx, row in enumerate(df[["main_category", "sub_category"]].drop_duplicates().to_dict(orient="records"), start=1)}
     df["category_id"] = df.apply(lambda x: category_map.get(
         f"{x['main_category']}|{x['sub_category']}"), axis=1)
     df = df.dropna(subset=["category_id"])
 
-    product_map = {
-        row["name"].lower(): idx
-        for idx, row in enumerate(df[["name"]].drop_duplicates().to_dict(orient="records"), start=1)
-    }
+    product_map = {row["name"].lower(): idx
+                   for idx, row in enumerate(df[["name"]].drop_duplicates().to_dict(orient="records"), start=1)}
     df["product_id"] = df["name"].str.lower().map(product_map)
     df = df.dropna(subset=["product_id"])
     return df
 
 
-# Tải và xử lý dữ liệu
 df_cleaned = clean_data(df)
 df_final = refactor_data(df_cleaned)
 
-# Tải embeddings và FAISS index
-embeddings = np.load(EMBEDDING_FILE)
-index = faiss.read_index(FAISS_INDEX_FILE)
-model = SentenceTransformer('all-MiniLM-L6-v2')
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model.to(device)
+# Get unique main categories for dropdown
+main_categories = ["All"] + \
+    sorted(df_cleaned["main_category"].unique().tolist())
 
-# Chuyển FAISS index sang GPU nếu có
-if torch.cuda.is_available():
-    res = faiss.StandardGpuResources()
-    gpu_index = faiss.index_cpu_to_gpu(res, 0, index)
-else:
-    gpu_index = index
-
-# Hàm tìm kiếm sản phẩm
+# Search function combining FAISS and PostgreSQL
 
 
-def search_products(query, top_k=5):
+def search_products(query, top_k, min_price, max_price, min_rating, main_category=None):
+    # Step 1: FAISS similarity search
     query_embedding = model.encode([query], device=device).astype('float32')
     gpu_index.nprobe = 10
-    distances, indices = gpu_index.search(query_embedding, top_k)
+    distances, indices = gpu_index.search(
+        query_embedding, top_k * 2)  # Fetch extra results to filter
+
+    # Step 2: Map FAISS indices to product_ids and convert to Python int
+    product_ids = [int(df_final["product_id"].iloc[idx])
+                   for idx in indices[0] if idx < len(df_final)]
+
+    # Step 3: Query PostgreSQL with filters
+    conn = connect_db()
+    if not conn:
+        return [], "❌ Không thể kết nối đến cơ sở dữ liệu."
+
+    with conn.cursor() as cur:
+        # Base query
+        query_sql = """
+            SELECT dp.product_id, dp.name, dp.image, dp.link, fr.rating, fr.rating_count, fr.actual_price, fr.discount_price
+            FROM dim_products dp
+            JOIN fact_reviews fr ON dp.product_id = fr.product_id
+            JOIN dim_categories dc ON dp.category_id = dc.category_id
+            WHERE dp.product_id = ANY(%s)
+            AND fr.discount_price BETWEEN %s AND %s
+            AND fr.rating >= %s
+        """
+        params = [product_ids, min_price, max_price, min_rating]
+
+        # Add main_category filter if specified
+        if main_category and main_category != "All":
+            query_sql += " AND dc.main_category = %s"
+            params.append(main_category)
+
+        # Add ordering and limit
+        query_sql += " ORDER BY fr.rating DESC LIMIT %s;"
+        params.append(top_k)
+
+        cur.execute(query_sql, tuple(params))
+        rows = cur.fetchall()
+
+    conn.close()
 
     results = []
-    for i in range(top_k):
-        idx = indices[0][i]
-        if idx < len(df_final):
-            product = df_final.iloc[idx]
-            results.append({
-                "name": product["name"],
-                "actual_price": product["actual_price"],
-                "discount_price": product["discount_price"],
-                "rating": product["ratings"],
-                "rating_count": product["no_of_ratings"],
-                "image": product["image"],
-                "distance": distances[0][i]
-            })
-    return results
+    for row in rows:
+        product_id, name, image, link, rating, rating_count, actual_price, discount_price = row
+        # Find the FAISS distance for this product
+        idx = df_final[df_final["product_id"] == product_id].index[0]
+        distance = distances[0][list(indices[0]).index(
+            idx)] if idx in indices[0] else float('inf')
+        results.append({
+            "name": name,
+            "actual_price": actual_price,
+            "discount_price": discount_price,
+            "rating": rating,
+            "rating_count": rating_count,
+            "image": image,
+            "link": link,
+            "distance": distance
+        })
 
-# Hàm tạo biểu đồ phân bố đánh giá
+    return results, ""
 
-
-def plot_rating_distribution(results):
-    ratings = [r["rating"] for r in results]
-    plt.figure(figsize=(8, 4))
-    plt.hist(ratings, bins=5, range=(0, 5),
-             color='lightgreen', edgecolor='black')
-    plt.title("Phân bố đánh giá của sản phẩm tìm kiếm")
-    plt.xlabel("Đánh giá (0-5)")
-    plt.ylabel("Số lượng")
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png")
-    buf.seek(0)
-    plt.close()
-    return Image.open(buf)
-
-# Hàm chính cho giao diện
+# Gradio interface
 
 
-def gradio_interface(query, top_k):
-    results = search_products(query, top_k)
+def gradio_interface(query, top_k, min_price, max_price, min_rating, main_category):
+    results, error_msg = search_products(
+        query, top_k, min_price, max_price, min_rating, main_category)
+
+    if error_msg:
+        return error_msg
+
+    if not results:
+        return "❌ Không tìm thấy sản phẩm nào phù hợp với tiêu chí tìm kiếm."
 
     output_text = ""
-    images = []
-    default_img = Image.new('RGB', (100, 100), color='gray')
+    # Fallback image URL
+    default_img_url = "https://via.placeholder.com/100x100.png?text=No+Image"
 
     for i, res in enumerate(results):
-        output_text += (f"**{i+1}. {res['name']}**\n"
-                        f"- Giá gốc: ₹{res['actual_price']:.2f}\n"
-                        f"- Giá giảm: ₹{res['discount_price']:.2f}\n"
-                        f"- Đánh giá: {res['rating']}/5 ({res['rating_count']} lượt)\n"
-                        f"- Khoảng cách: {res['distance']:.4f}\n\n")
-        try:
-            response = requests.get(res["image"], stream=True, timeout=5)
-            response.raise_for_status()
-            img = Image.open(response.raw)
-            images.append(img)
-        except (requests.RequestException, Exception):
-            images.append(default_img)
+        # Use product link for clickable name
+        name_link = f"<a href='{res['link']}' target='_blank'>{res['name']}</a>"
+        # Use image URL directly in HTML, with fallback
+        img_src = res['image'] if res['image'] else default_img_url
+        # Construct the result with image and text side by side
+        output_text += (
+            f"<div style='display: flex; align-items: center; margin-bottom: 20px;'>"
+            f"<img src='{img_src}' width='100' height='100' style='margin-right: 20px;' "
+            f"onerror=\"this.src='{default_img_url}'\">"
+            f"<div>"
+            f"**{i+1}. {name_link}**<br>"
+            f"- Giá gốc: ₹{res['actual_price']:.2f}<br>"
+            f"- Giá giảm: ₹{res['discount_price']:.2f}<br>"
+            f"- Đánh giá: {res['rating']}/5 ({res['rating_count']} lượt)<br>"
+            f"- Khoảng cách: {res['distance']:.4f}"
+            f"</div>"
+            f"</div>"
+        )
 
-    rating_plot = plot_rating_distribution(results)
-    return output_text, images, rating_plot
+    return output_text
 
 
-# Xây dựng giao diện Gradio
-with gr.Blocks(title="Hệ thống tìm kiếm sản phẩm Amazon") as demo:
-    gr.Markdown("# Tìm kiếm sản phẩm thông minh")
-    gr.Markdown(
-        "Nhập từ khóa để tìm kiếm sản phẩm từ dữ liệu Amazon. Xem thông tin chi tiết, hình ảnh và phân bố đánh giá.")
+# Gradio UI
+with gr.Blocks(title="Hệ thống tìm kiếm sản phẩm Amazon (Hybrid)") as demo:
+    gr.Markdown("# Tìm kiếm sản phẩm thông minh (FAISS + PostgreSQL)")
+    gr.Markdown("Nhập từ khóa và bộ lọc để tìm kiếm sản phẩm từ dữ liệu Amazon.")
 
     with gr.Row():
         query_input = gr.Textbox(
             label="Từ khóa tìm kiếm", placeholder="Ví dụ: cables")
         top_k_input = gr.Slider(1, 50, value=5, step=1,
                                 label="Số lượng kết quả")
-        submit_btn = gr.Button("Tìm kiếm")
 
+    gr.Markdown("## Bộ lọc")  # Title for filter block
     with gr.Row():
-        with gr.Column(scale=2):
-            output_text = gr.Markdown(label="Kết quả tìm kiếm")
-        with gr.Column(scale=1):
-            output_images = gr.Gallery(
-                label="Hình ảnh sản phẩm", show_label=True)
+        min_price_input = gr.Number(label="Giá tối thiểu (₹)", value=0)
+        max_price_input = gr.Number(label="Giá tối đa (₹)", value=1000)
+        min_rating_input = gr.Slider(
+            0, 5, value=0, step=0.1, label="Đánh giá tối thiểu")
+    with gr.Row():
+        main_category_input = gr.Dropdown(
+            choices=main_categories, label="Danh mục chính", value="All")
 
-    with gr.Row():
-        output_plot = gr.Image(label="Phân bố đánh giá")
+    submit_btn = gr.Button("Tìm kiếm")
+
+    output_text = gr.Markdown(label="Kết quả tìm kiếm",
+                              value="Kết quả tìm kiếm sẽ hiển thị ở đây.")
 
     submit_btn.click(
         fn=gradio_interface,
-        inputs=[query_input, top_k_input],
-        outputs=[output_text, output_images, output_plot]
+        inputs=[query_input, top_k_input, min_price_input,
+                max_price_input, min_rating_input, main_category_input],
+        outputs=[output_text]
     )
 
-# Khởi chạy giao diện
 if __name__ == "__main__":
     demo.launch(share=True)
