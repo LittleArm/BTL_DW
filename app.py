@@ -201,7 +201,7 @@ for file_path in [CSV_FILE, EMBEDDING_FILE, FAISS_INDEX_FILE]:
 df_app2 = pd.read_csv(CSV_FILE, encoding="utf-8")
 embeddings = np.load(EMBEDDING_FILE)
 index = faiss.read_index(FAISS_INDEX_FILE)
-model = SentenceTransformer('all-MiniLM-L6-v2')
+model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model.to(device)
 
