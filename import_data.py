@@ -7,17 +7,18 @@ from sentence_transformers import SentenceTransformer
 # 🔹 Tạo database dưới local trước
 # 🔹 Thông tin kết nối PostgreSQL
 DB_CONFIG = {
-    "dbname": "your_database",
-    "user": "your_user",
-    "password": "your_password",
-    "host": "localhost",
+    "dbname": "amazon",
+    "user": "postgres",
+    "password": "user",
+    "host": "34.142.201.81",  # Gcloud: 34.142.201.81
     "port": "5432"
 }
 
 # 🔹 Đường dẫn file CSV & embeddings
-CSV_FILE = "C:/import_data/amazon.csv"
+CSV_FILE = "E:/242/DW&DSS/amazon.csv"
 EMBEDDING_FILE = "C:/import_data/embeddings.npy"
 FAISS_INDEX_FILE = "C:/import_data/faiss_index.bin"
+
 
 def connect_db():
     """ Kết nối PostgreSQL """
@@ -28,6 +29,7 @@ def connect_db():
     except psycopg2.Error as e:
         print(f"❌ Lỗi kết nối PostgreSQL: {e}")
         return None
+
 
 def create_tables(conn):
     """ Tạo bảng theo Star Schema """
@@ -62,24 +64,27 @@ def create_tables(conn):
         """)
         print("✅ Tables created successfully.")
 
+
 def clean_data(df):
     """Làm sạch và chuẩn hóa dữ liệu từ CSV"""
     df = df.copy()
 
     # Chuẩn hóa tên cột
-    df["main_category"] = df["main_category"].astype(str).str.strip().str.title()
-    df["sub_category"] = df["sub_category"].astype(str).str.strip().str.title()
-    df["name"] = df["name"].astype(str).str.strip()
-    
+    df["main_category"] = df["category"].astype(str).str.split("|").str[0]
+    df["sub_category"] = df["category"].astype(
+        str).str.split("|", n=1).str[-1].str.strip()
+
+    df["name"] = df["product_name"].astype(str).str.strip()
+
     # Xóa ký tự ₹ và dấu phẩy trong giá tiền, chuyển thành số
     def safe_float_convert(value):
         try:
             return float(re.sub(r"[₹,]", "", str(value))) if value not in ["", "nan", None] else None
         except ValueError:
-            return None 
-        
+            return None
+
     df["actual_price"] = df["actual_price"].apply(safe_float_convert)
-    df["discount_price"] = df["discount_price"].apply(safe_float_convert)
+    df["discount_price"] = df["discounted_price"].apply(safe_float_convert)
 
     # Làm sạch cột no_of_ratings
     def clean_ratings(value):
@@ -87,7 +92,7 @@ def clean_data(df):
             return int(value.replace(",", ""))
         return None  # Trả về None thay vì 0 để lọc bỏ khi dropna
 
-    df["no_of_ratings"] = df["no_of_ratings"].apply(clean_ratings)
+    df["no_of_ratings"] = df["rating_count"].apply(clean_ratings)
 
     # Làm sạch cột ratings
     def clean_ratings_value(value):
@@ -96,12 +101,17 @@ def clean_data(df):
         except (ValueError, TypeError):
             return None  # Trả về None thay vì 0 để lọc bỏ khi dropna
 
-    df["ratings"] = df["ratings"].apply(clean_ratings_value)
+    df["ratings"] = df["rating"].apply(clean_ratings_value)
 
     # 🔹 Loại bỏ hàng có NaN ở các cột quan trọng
-    df = df.dropna(subset=["actual_price", "discount_price", "ratings", "no_of_ratings"])
+    df = df.dropna(
+        subset=["actual_price", "discount_price", "ratings", "no_of_ratings"])
+
+    df["image"] = df["img_link"].astype(str).str.strip()
+    df["link"] = df["product_link"].astype(str).str.strip()
 
     return df
+
 
 def import_data(conn, df):
     """ Nhập dữ liệu vào PostgreSQL """
@@ -113,9 +123,11 @@ def import_data(conn, df):
         """, df[["main_category", "sub_category"]].drop_duplicates().values.tolist())
 
         # 🔹 Lấy category_id từ PostgreSQL
-        cur.execute("SELECT category_id, main_category, sub_category FROM dim_categories;")
+        cur.execute(
+            "SELECT category_id, main_category, sub_category FROM dim_categories;")
         category_map = {f"{row[1]}|{row[2]}": row[0] for row in cur.fetchall()}
-        df["category_id"] = df.apply(lambda x: category_map.get(f"{x['main_category']}|{x['sub_category']}", None), axis=1)
+        df["category_id"] = df.apply(lambda x: category_map.get(
+            f"{x['main_category']}|{x['sub_category']}", None), axis=1)
         df = df.dropna(subset=["category_id"])
 
         # 🔹 Chèn dữ liệu vào dim_products
@@ -138,6 +150,7 @@ def import_data(conn, df):
 
         print("✅ Data imported successfully.")
 
+
 def main():
     conn = connect_db()
     if not conn:
@@ -150,6 +163,7 @@ def main():
 
     import_data(conn, df)  # 🔹 Nhập dữ liệu trước
     conn.close()
+
 
 if __name__ == "__main__":
     main()
