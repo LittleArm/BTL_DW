@@ -15,9 +15,9 @@ DB_CONFIG = {
 }
 
 # 🔹 Đường dẫn file CSV & embeddings
-CSV_FILE = "E:/242/DW&DSS/amazon.csv"
-EMBEDDING_FILE = "C:/import_data/embeddings.npy"
-FAISS_INDEX_FILE = "C:/import_data/faiss_index.bin"
+CSV_FILE = "./amazon.csv"
+EMBEDDING_FILE = "./data/embeddings.npy"
+FAISS_INDEX_FILE = "./data/faiss_index.bin"
 
 
 def connect_db():
@@ -113,6 +113,29 @@ def clean_data(df):
     return df
 
 
+def refactor_data(df):
+
+    category_map = {
+        f"{row['main_category']}|{row['sub_category']}": idx
+        for idx, row in enumerate(df[["main_category", "sub_category"]].drop_duplicates().to_dict(orient="records"), start=1)
+    }
+
+    df["category_id"] = df.apply(lambda x: category_map.get(
+        f"{x['main_category']}|{x['sub_category']}"), axis=1)
+    df = df.dropna(subset=["category_id"])
+
+    product_map = {
+        row["name"].lower(): idx
+        for idx, row in enumerate(df[["name"]].drop_duplicates().to_dict(orient="records"), start=1)
+    }
+
+    df["product_id"] = df["name"].str.lower().map(product_map)
+    df = df.dropna(subset=["product_id"])
+
+    print("✅ Data refactored successfully.")
+    return df
+
+
 def import_data(conn, df):
     """ Nhập dữ liệu vào PostgreSQL """
     with conn.cursor() as cur:
@@ -159,9 +182,10 @@ def main():
     create_tables(conn)
 
     df = pd.read_csv(CSV_FILE, encoding="utf-8")
-    df = clean_data(df)
+    df_cleaned = clean_data(df)
+    refactor_data(df_cleaned)
 
-    import_data(conn, df)  # 🔹 Nhập dữ liệu trước
+    import_data(conn, df_cleaned)  # 🔹 Nhập dữ liệu trước
     conn.close()
 
 
