@@ -15,7 +15,7 @@ DB_CONFIG = {
     "dbname": "amazon",
     "user": "postgres",
     "password": "user",
-    "host": "34.142.193.208",
+    "host": "localhost",
     "port": "5432"
 }
 
